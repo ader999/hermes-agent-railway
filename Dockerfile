@@ -6,6 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     AUTO_UPDATE=false \
     HERMES_NO_AUTO_UPDATE=1 \
+    HERMES_HOME=/root/.hermes \
     PATH="/root/.local/bin:/usr/local/bin:$PATH"
 
 # Install system dependencies

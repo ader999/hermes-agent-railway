@@ -12,6 +12,18 @@ export AUTO_UPDATE=false
 export HERMES_NO_AUTO_UPDATE=1
 echo "-> Configuration enforced: AUTO_UPDATE=false, HERMES_NO_AUTO_UPDATE=1"
 
+# Define explicitly HERMES_HOME
+export HERMES_HOME="/root/.hermes"
+echo "-> Enforcing HERMES_HOME=$HERMES_HOME"
+
+# Create directories inside HERMES_HOME if they don't exist to support empty persistent volumes
+echo "-> Verifying directory structure in $HERMES_HOME..."
+mkdir -p "$HERMES_HOME"/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache}
+if [ ! -f "$HERMES_HOME/.env" ]; then
+    echo "-> Creating empty .env file..."
+    touch "$HERMES_HOME/.env"
+fi
+
 # Signal handling for container graceful shutdown
 cleanup() {
     echo "-> Caught signal! Initiating graceful shutdown sequence..."

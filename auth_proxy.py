@@ -510,7 +510,10 @@ def restart_gateway():
     try:
         subprocess.run(["pkill", "-f", "hermes gateway run"])
         time.sleep(1)
-        subprocess.Popen(["hermes", "gateway", "run"])
+        # Propagate environment explicitly including HERMES_HOME
+        env = os.environ.copy()
+        env["HERMES_HOME"] = HERMES_HOME
+        subprocess.Popen(["hermes", "gateway", "run"], env=env)
         return jsonify({"status": "gateway restarted"})
     except Exception as e:
         logger.error(f"Failed to restart gateway: {e}")
