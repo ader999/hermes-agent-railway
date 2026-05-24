@@ -1,73 +1,101 @@
-#!/usr/bin/env python3
-"""Cookie-based auth proxy for Hermes dashboard on Railway."""
+from gevent import monkey
+monkey.patch_all()
 
-import hashlib
-import hmac
 import os
-import secrets
-import string
-import subprocess
 import sys
 import time
+import hmac
+import hashlib
+import secrets
+import logging
+import subprocess
+from collections import defaultdict
 
-from aiohttp import web, ClientSession, WSMsgType
+import requests
+import websocket
+import gevent
+from flask import Flask, request, Response, redirect, url_for, jsonify, render_template_string
+
+# Setup basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("auth_proxy")
 
 HERMES_HOME = "/root/.hermes"
-UPSTREAM = "http://127.0.0.1:9119"
+UPSTREAM = os.environ.get("HERMES_UPSTREAM", "http://127.0.0.1:9119")
 USERNAME = os.environ.get("DASHBOARD_USER", "admin")
 PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-SECRET = secrets.token_bytes(32)
 COOKIE = "hermes_auth"
 MAX_AGE = 7 * 86400
 
+# Derive a consistent HMAC key from PASSWORD to survive restarts, or fallback to random
 if not PASSWORD:
-    print("ERROR: DASHBOARD_PASSWORD must be set.", file=sys.stderr)
+    logger.error("ERROR: DASHBOARD_PASSWORD must be set.")
     sys.exit(1)
 
+# Derive stable 32-byte secret key from password
+SECRET_KEY = hashlib.sha256(PASSWORD.encode()).digest()
+
+# Rate limiting settings
+RATE_LIMIT = 30  # requests per minute
+RATE_LIMIT_WINDOW = 60  # seconds
+login_attempts = defaultdict(list)
+
+def is_rate_limited(ip):
+    now = time.time()
+    # Prune old timestamps
+    login_attempts[ip] = [t for t in login_attempts[ip] if now - t < RATE_LIMIT_WINDOW]
+    if len(login_attempts[ip]) >= RATE_LIMIT:
+        return True
+    login_attempts[ip].append(now)
+    return False
 
 def make_token():
     expires = str(int(time.time()) + MAX_AGE)
-    sig = hmac.new(SECRET, expires.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(SECRET_KEY, expires.encode(), hashlib.sha256).hexdigest()
     return f"{expires}.{sig}"
-
 
 def check_token(token):
     try:
         expires, sig = token.rsplit(".", 1)
         if int(expires) < time.time():
             return False
-        expected = hmac.new(SECRET, expires.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(SECRET_KEY, expires.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, expected)
     except Exception:
         return False
 
-
+# Custom cyberpunk terminal styled login page
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hermes Agent</title>
+<title>Hermes Agent Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg: #0a0f14;
-    --surface: #111920;
-    --border: rgba(255,255,255,0.06);
-    --border-focus: rgba(45,212,191,0.4);
-    --text: #e0f0f0;
-    --text-muted: #7899aa;
-    --accent: #2dd4bf;
-    --accent-dim: rgba(45,212,191,0.1);
-    --error-bg: rgba(180,60,60,0.1);
-    --error-border: rgba(180,60,60,0.25);
-    --error-text: #d4908a;
+    --bg: #03070c;
+    --surface: rgba(10, 18, 30, 0.75);
+    --border: rgba(0, 255, 204, 0.15);
+    --border-focus: rgba(0, 255, 204, 0.7);
+    --text: #00ffcc;
+    --text-muted: #4e7370;
+    --accent: #00ffcc;
+    --accent-glow: rgba(0, 255, 204, 0.3);
+    --error-bg: rgba(255, 0, 85, 0.1);
+    --error-border: rgba(255, 0, 85, 0.4);
+    --error-text: #ff0055;
+    --terminal-output: #08161a;
   }
   body {
-    font-family: 'DM Sans', sans-serif;
+    font-family: 'JetBrains Mono', monospace;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
@@ -77,255 +105,281 @@ LOGIN_HTML = """<!DOCTYPE html>
     position: relative;
     overflow: hidden;
   }
+  /* Retro scanlines and grid effect */
   body::before {
     content: '';
     position: fixed;
     inset: 0;
-    background:
-      radial-gradient(ellipse 80% 60% at 50% 0%, rgba(45,212,191,0.04) 0%, transparent 60%),
-      radial-gradient(ellipse 60% 80% at 80% 100%, rgba(255,255,255,0.02) 0%, transparent 50%);
+    background: 
+      linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
+      linear-gradient(90deg, rgba(255, 0, 0, 0.04), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.04));
+    background-size: 100% 4px, 6px 100%;
+    z-index: 10;
     pointer-events: none;
   }
   body::after {
     content: '';
     position: fixed;
     inset: 0;
-    background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    background: radial-gradient(circle, transparent 20%, #03070c 80%);
+    z-index: 2;
     pointer-events: none;
-    opacity: 0.5;
   }
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(16px); }
-    to { opacity: 1; transform: translateY(0); }
+  .grid-bg {
+    position: fixed;
+    inset: 0;
+    background-image: 
+      linear-gradient(to right, rgba(0, 255, 204, 0.02) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(0, 255, 204, 0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+    z-index: 1;
+    pointer-events: none;
   }
-  @keyframes lineGrow {
-    from { transform: scaleX(0); }
-    to { transform: scaleX(1); }
+  @keyframes scanline {
+    0% { transform: translateY(-100%); }
+    100% { transform: translateY(100%); }
+  }
+  .scanline-animation {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 10px;
+    background: rgba(0, 255, 204, 0.03);
+    box-shadow: 0 0 10px rgba(0, 255, 204, 0.15);
+    z-index: 3;
+    animation: scanline 8s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+  .cursor-blink {
+    animation: blink 1s step-start infinite;
   }
   .login-wrapper {
     position: relative;
-    z-index: 1;
+    z-index: 5;
     width: 100%;
-    max-width: 400px;
+    max-width: 440px;
     padding: 0 1.5rem;
-    animation: fadeUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .terminal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2rem;
+    box-shadow: 0 0 35px rgba(0, 255, 204, 0.05), inset 0 0 15px rgba(0, 255, 204, 0.02);
+    backdrop-filter: blur(12px);
+    position: relative;
+  }
+  .terminal-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 3px;
+    background: linear-gradient(90deg, #00ffcc, #8a2be2);
+  }
+  .terminal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .terminal-dots {
+    display: flex;
+    gap: 6px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+  }
+  .dot.active {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+  }
+  .terminal-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
   }
   .brand {
-    text-align: center;
-    margin-bottom: 3rem;
-  }
-  .brand-icon {
-    width: 36px;
-    height: 36px;
-    margin: 0 auto 1.2rem;
-    border: 1.5px solid var(--accent);
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--accent);
-    font-family: 'Cormorant Garamond', serif;
-    font-size: 1.1rem;
-    font-weight: 600;
-    opacity: 0;
-    animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both;
+    text-align: left;
+    margin-bottom: 1.5rem;
   }
   .brand h1 {
-    font-family: 'Cormorant Garamond', serif;
-    font-weight: 400;
-    font-size: 1.6rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--text);
-    opacity: 0;
-    animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.2s both;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: 1px;
+    margin-bottom: 0.2rem;
+    text-shadow: 0 0 8px var(--accent-glow);
   }
   .brand p {
-    font-size: 0.78rem;
+    font-size: 0.75rem;
     color: var(--text-muted);
-    margin-top: 0.5rem;
-    letter-spacing: 0.04em;
-    opacity: 0;
-    animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.3s both;
   }
-  .divider {
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--border-focus), transparent);
-    margin-bottom: 2.5rem;
-    transform-origin: center;
-    animation: lineGrow 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.4s both;
+  .terminal-logs {
+    background: var(--terminal-output);
+    border-radius: 3px;
+    padding: 0.75rem;
+    font-size: 0.7rem;
+    color: #83b6b0;
+    margin-bottom: 1.5rem;
+    border-left: 2px solid var(--accent);
+    line-height: 1.4;
   }
-  .card {
-    opacity: 0;
-    animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.45s both;
+  .log-line {
+    margin-bottom: 2px;
+    display: flex;
+    gap: 8px;
+  }
+  .log-line span.ok {
+    color: #00ffcc;
+    font-weight: bold;
   }
   .field {
     margin-bottom: 1.25rem;
+    position: relative;
   }
   label {
     display: block;
     font-size: 0.7rem;
-    font-weight: 500;
+    font-weight: 700;
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.1em;
+    letter-spacing: 1.5px;
     margin-bottom: 0.5rem;
+  }
+  .input-wrapper {
+    position: relative;
+  }
+  .input-wrapper::before {
+    content: '>';
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.9rem;
+    color: var(--accent);
   }
   input {
     width: 100%;
-    padding: 0.75rem 1rem;
-    background: var(--surface);
+    padding: 0.75rem 0.75rem 0.75rem 25px;
+    background: rgba(0, 0, 0, 0.5);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 3px;
     color: var(--text);
-    font-family: 'DM Sans', sans-serif;
-    font-size: 0.9rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
     outline: none;
-    transition: border-color 0.3s, box-shadow 0.3s;
+    transition: all 0.3s ease;
   }
-  input::placeholder { color: var(--text-muted); opacity: 0.5; }
   input:focus {
     border-color: var(--border-focus);
-    box-shadow: 0 0 0 3px var(--accent-dim);
+    box-shadow: 0 0 10px rgba(0, 255, 204, 0.15), inset 0 0 5px rgba(0, 255, 204, 0.05);
   }
   button {
     width: 100%;
     padding: 0.8rem;
-    margin-top: 0.5rem;
-    background: var(--accent);
-    color: var(--bg);
-    border: none;
-    border-radius: 8px;
-    font-family: 'DM Sans', sans-serif;
-    font-size: 0.85rem;
-    font-weight: 500;
-    letter-spacing: 0.06em;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 2px;
     text-transform: uppercase;
     cursor: pointer;
-    transition: transform 0.2s, opacity 0.2s;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
   }
-  button:hover { opacity: 0.88; transform: translateY(-1px); }
-  button:active { transform: translateY(0); }
+  button:hover {
+    background: var(--accent);
+    color: var(--bg);
+    box-shadow: 0 0 15px rgba(0, 255, 204, 0.4);
+  }
+  button:active {
+    transform: scale(0.98);
+  }
   .error {
     background: var(--error-bg);
     border: 1px solid var(--error-border);
     color: var(--error-text);
-    padding: 0.6rem 0.9rem;
-    border-radius: 8px;
-    font-size: 0.8rem;
+    padding: 0.75rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
     margin-bottom: 1.25rem;
-    text-align: center;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .error::before {
+    content: '[!]';
+    font-weight: bold;
   }
 </style>
 </head>
 <body>
+<div class="grid-bg"></div>
+<div class="scanline-animation"></div>
 <div class="login-wrapper">
-  <div class="brand">
-    <div class="brand-icon">H</div>
-    <h1>Hermes</h1>
-    <p>Agent Console</p>
-  </div>
-  <div class="divider"></div>
-  <div class="card">
-    $error
+  <div class="terminal-card">
+    <div class="terminal-header">
+      <div class="terminal-dots">
+        <div class="dot active"></div>
+        <div class="dot"></div>
+        <div class="dot"></div>
+      </div>
+      <div class="terminal-title">AUTH_GATE_V2.1</div>
+    </div>
+    
+    <div class="brand">
+      <h1>HERMES AGENT</h1>
+      <p>HARDENED GATEWAY PROXY</p>
+    </div>
+
+    <div class="terminal-logs">
+      <div class="log-line"><span class="ok">[OK]</span> SECURE_TUNNEL_ACTIVE</div>
+      <div class="log-line"><span class="ok">[OK]</span> HMAC_SHA256_ACTIVE</div>
+      <div class="log-line"><span class="ok">[OK]</span> RATE_LIMITER_ENGAGED</div>
+    </div>
+
+    {% if error %}
+    <div class="error">
+      {{ error }}
+    </div>
+    {% endif %}
+
     <form method="POST" action="/login">
       <div class="field">
-        <label for="username">Username</label>
-        <input id="username" name="username" type="text" autocomplete="username" required>
+        <label for="username">OPERATOR_ID</label>
+        <div class="input-wrapper">
+          <input id="username" name="username" type="text" autocomplete="username" required placeholder="admin">
+        </div>
       </div>
       <div class="field">
-        <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <label for="password">ACCESS_KEY</label>
+        <div class="input-wrapper">
+          <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="••••••••">
+        </div>
       </div>
-      <button type="submit">Continue</button>
+      <button type="submit">AUTHENTICATE <span class="cursor-blink">_</span></button>
     </form>
   </div>
 </div>
 </body>
 </html>"""
 
-
-async def login_page(request):
-    error = ""
-    if request.query.get("error"):
-        error = '<div class="error">Invalid username or password</div>'
-    return web.Response(
-        text=string.Template(LOGIN_HTML).safe_substitute(error=error),
-        content_type="text/html",
-    )
-
-
-async def login_post(request):
-    data = await request.post()
-    username = data.get("username", "")
-    password = data.get("password", "")
-
-    if hmac.compare_digest(username, USERNAME) and hmac.compare_digest(password, PASSWORD):
-        resp = web.HTTPFound("/")
-        resp.set_cookie(COOKIE, make_token(), max_age=MAX_AGE, httponly=True, samesite="Lax")
-        return resp
-
-    raise web.HTTPFound("/login?error=1")
-
-
-async def logout(request):
-    resp = web.HTTPFound("/login")
-    resp.del_cookie(COOKIE)
-    return resp
-
-
-@web.middleware
-async def auth_middleware(request, handler):
-    if request.path in ("/login", "/logout", "/api/health"):
-        return await handler(request)
-
-    token = request.cookies.get(COOKIE)
-    if not token or not check_token(token):
-        if request.path.startswith("/api/"):
-            raise web.HTTPUnauthorized()
-        raise web.HTTPFound("/login")
-
-    return await handler(request)
-
-
-gateway_process = None
-
-
-def start_gateway():
-    global gateway_process
-    if gateway_process and gateway_process.poll() is None:
-        gateway_process.terminate()
-        try:
-            gateway_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            gateway_process.kill()
-    gateway_process = subprocess.Popen(["hermes", "gateway", "run"])
-
-
-RESTART_PATHS = {
-    ("PUT", "/api/config"),
-    ("PUT", "/api/env"),
-    ("DELETE", "/api/env"),
-}
-
-
-def volume_attached():
-    return os.path.ismount(HERMES_HOME)
-
-
-async def restart_gateway(request):
-    start_gateway()
-    return web.json_response({"status": "gateway restarted"})
-
-
-async def gateway_status(request):
-    running = gateway_process is not None and gateway_process.poll() is None
-    return web.json_response({
-        "running": running,
-        "volume": volume_attached(),
-    })
-
-
+# Status Widget to inject in downstream web UI
 GATEWAY_WIDGET = """
 <div id="gw-widget" style="position:fixed;bottom:20px;right:20px;z-index:99999;
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;">
@@ -365,85 +419,229 @@ gwStatus();setInterval(gwStatus,10000);
 </script>
 """
 
+# Flask App Initialisation
+app = Flask(__name__)
 
-async def health(request):
-    return web.json_response({"status": "ok"})
+# Helpers to manage gateway status
+def volume_attached():
+    return os.path.ismount(HERMES_HOME)
 
+def is_gateway_running():
+    # Check 1: pgrep for hermes gateway
+    try:
+        res = subprocess.run(["pgrep", "-f", "hermes gateway run"], capture_output=True)
+        if res.returncode == 0:
+            return True
+    except Exception:
+        pass
+    # Check 2: Connection to API port 8642
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            s.connect(('127.0.0.1', 8642))
+            return True
+    except Exception:
+        pass
+    return False
 
-async def proxy_ws(request):
-    ws_client = web.WebSocketResponse()
-    await ws_client.prepare(request)
+# Security headers middleware
+@app.after_request
+def add_security_headers(response):
+    response.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://fonts.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self' wss: ws:; "
+        "frame-ancestors 'none';"
+    )
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=(), interest-cohort=()'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
 
-    async with ClientSession() as session:
-        url = f"ws://127.0.0.1:9119{request.path_qs}"
-        async with session.ws_connect(url) as ws_upstream:
+# Web Routes
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    ip = request.remote_addr or 'unknown'
+    if is_rate_limited(ip):
+        logger.warning(f"Rate limit exceeded for IP: {ip}")
+        return Response("Too Many Requests", status=429)
 
-            async def forward(src, dst):
-                async for msg in src:
-                    if msg.type == WSMsgType.TEXT:
-                        await dst.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await dst.send_bytes(msg.data)
-                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+    error = None
+    if request.method == 'POST':
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        
+        if hmac.compare_digest(username, USERNAME) and hmac.compare_digest(password, PASSWORD):
+            resp = redirect(url_for('proxy_root'))
+            resp.set_cookie(COOKIE, make_token(), max_age=MAX_AGE, httponly=True, samesite="Lax")
+            logger.info(f"Operator authenticated successfully from IP: {ip}")
+            return resp
+        else:
+            logger.warning(f"Failed authentication attempt from IP: {ip}")
+            error = "ACCESS DENIED: Invalid operator ID or access key"
+            
+    return render_template_string(LOGIN_HTML, error=error)
+
+@app.route('/logout')
+def logout():
+    resp = redirect(url_for('login'))
+    resp.delete_cookie(COOKIE)
+    return resp
+
+@app.route('/api/health')
+def health():
+    return jsonify({"status": "ok"})
+
+@app.route('/api/gateway/restart', methods=['POST'])
+def restart_gateway():
+    # Authentication check
+    token = request.cookies.get(COOKIE)
+    if not token or not check_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    logger.info("Restarting hermes gateway...")
+    try:
+        subprocess.run(["pkill", "-f", "hermes gateway run"])
+        time.sleep(1)
+        subprocess.Popen(["hermes", "gateway", "run"])
+        return jsonify({"status": "gateway restarted"})
+    except Exception as e:
+        logger.error(f"Failed to restart gateway: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/gateway/status')
+def gateway_status():
+    token = request.cookies.get(COOKIE)
+    if not token or not check_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    return jsonify({
+        "running": is_gateway_running(),
+        "volume": volume_attached()
+    })
+
+# Main proxy and websocket proxy route
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
+def proxy_root(path):
+    # Verify Authentication
+    token = request.cookies.get(COOKIE)
+    if not token or not check_token(token):
+        if request.path.startswith('/api/'):
+            return Response("Unauthorized", status=401)
+        return redirect(url_for('login'))
+
+    # WebSocket Proxy Implementation
+    ws = request.environ.get('wsgi.websocket')
+    if ws:
+        # Convert UPSTREAM http to ws
+        ws_upstream_url = UPSTREAM.replace('http://', 'ws://').replace('https://', 'wss://') + '/' + path
+        if request.query_string:
+            ws_upstream_url += '?' + request.query_string.decode('utf-8')
+            
+        logger.info(f"Establishing WebSocket tunnel: {request.path} -> {ws_upstream_url}")
+        try:
+            ws_upstream = websocket.create_connection(ws_upstream_url)
+        except Exception as e:
+            logger.error(f"WebSocket upstream connection failed: {e}")
+            return Response("Bad Gateway", status=502)
+            
+        def tunnel_client_to_upstream():
+            try:
+                while True:
+                    msg = ws.receive()
+                    if msg is None:
                         break
+                    ws_upstream.send(msg)
+            except Exception:
+                pass
+            finally:
+                try:
+                    ws_upstream.close()
+                except Exception:
+                    pass
 
-            import asyncio
-            await asyncio.gather(
-                forward(ws_client, ws_upstream),
-                forward(ws_upstream, ws_client),
-            )
+        def tunnel_upstream_to_client():
+            try:
+                while True:
+                    msg = ws_upstream.recv()
+                    ws.send(msg)
+            except Exception:
+                pass
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
-    return ws_client
+        g1 = gevent.spawn(tunnel_client_to_upstream)
+        g2 = gevent.spawn(tunnel_upstream_to_client)
+        gevent.joinall([g1, g2])
+        return ""
 
+    # HTTP / Streaming Proxy Implementation
+    url = f"{UPSTREAM}/{path}"
+    if request.query_string:
+        url += f"?{request.query_string.decode('utf-8')}"
 
-async def proxy(request):
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return await proxy_ws(request)
+    # Forward headers
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
+    
+    # Forward body
+    data = request.get_data()
 
-    async with ClientSession() as session:
-        url = f"{UPSTREAM}{request.path_qs}"
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "transfer-encoding")}
-
-        body = await request.read()
-        async with session.request(
-            request.method,
-            url,
+    try:
+        resp = requests.request(
+            method=request.method,
+            url=url,
             headers=headers,
-            data=body,
-            allow_redirects=False,
-        ) as resp:
-            excluded = {"transfer-encoding", "content-encoding", "content-length"}
-            proxy_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
-            content = await resp.read()
-            if (request.method, request.path) in RESTART_PATHS and resp.status < 400:
-                start_gateway()
+            data=data,
+            stream=True,
+            allow_redirects=False
+        )
+    except Exception as e:
+        logger.error(f"HTTP upstream connection failed for {url}: {e}")
+        return Response("Bad Gateway", status=502)
 
-            content_type = resp.headers.get("content-type", "")
-            if "text/html" in content_type:
-                html_headers = {k: v for k, v in proxy_headers.items() if k.lower() != "content-type"}
-                html = content.decode("utf-8", errors="replace")
-                html = html.replace("</body>", GATEWAY_WIDGET + "</body>")
-                return web.Response(status=resp.status, headers=html_headers, text=html, content_type="text/html")
-            return web.Response(status=resp.status, headers=proxy_headers, body=content)
+    # Filter upstream response headers
+    excluded = {'transfer-encoding', 'content-encoding', 'content-length'}
+    proxy_headers = {k: v for k, v in resp.raw.headers.items() if k.lower() not in excluded}
+
+    content_type = resp.headers.get('content-type', '')
+    
+    # Inject widget on HTML pages
+    if 'text/html' in content_type:
+        try:
+            html = resp.content.decode('utf-8', errors='replace')
+            if '</body>' in html:
+                html = html.replace('</body>', GATEWAY_WIDGET + '</body>')
+            return Response(html, status=resp.status_code, headers=proxy_headers, content_type='text/html')
+        except Exception as e:
+            logger.error(f"Error parsing HTML response: {e}")
+
+    # Streaming support
+    def generate():
+        try:
+            for chunk in resp.iter_content(chunk_size=4096):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+
+    return Response(generate(), status=resp.status_code, headers=proxy_headers, content_type=content_type)
 
 
-async def on_startup(app):
-    start_gateway()
-
-
-def create_app():
-    app = web.Application(middlewares=[auth_middleware])
-    app.on_startup.append(on_startup)
-    app.router.add_get("/login", login_page)
-    app.router.add_post("/login", login_post)
-    app.router.add_get("/logout", logout)
-    app.router.add_get("/api/health", health)
-    app.router.add_post("/api/gateway/restart", restart_gateway)
-    app.router.add_get("/api/gateway/status", gateway_status)
-    app.router.add_route("*", "/{path_info:.*}", proxy)
-    return app
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    from gevent.pywsgi import WSGIServer
+    from geventwebsocket.handler import WebSocketHandler
+    
     port = int(os.environ.get("PORT", 8080))
-    web.run_app(create_app(), host="0.0.0.0", port=port)
+    logger.info(f"Starting hardened Flask-Gevent proxy on port {port}...")
+    server = WSGIServer(('0.0.0.0', port), app, handler_class=WebSocketHandler)
+    server.serve_forever()
