@@ -640,6 +640,95 @@ def proxy_root(path):
     return Response(generate(), status=resp.status_code, headers=proxy_headers, content_type=content_type)
 
 
+
+# =====================================================================
+# ── XANA OS - TOOL NOTIFICATION ENHANCEMENTS ─────────────────────────
+# =====================================================================
+def get_search_backend():
+    try:
+        if os.path.exists("/root/.hermes/config.yaml"):
+            with open("/root/.hermes/config.yaml", "r") as f:
+                content = f.read()
+                import re
+                match = re.search(r'search_backend:\s*(\w+)', content)
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return "tavily"
+
+def send_telegram_notification(message):
+    try:
+        token = None
+        if os.path.exists("/root/.hermes/.env"):
+            with open("/root/.hermes/.env", "r") as f:
+                for line in f:
+                    if line.startswith("TELEGRAM_BOT_TOKEN="):
+                        token = line.strip().split("=", 1)[1]
+                        break
+        
+        chat_id = "1687134500"
+        if os.path.exists("/root/.hermes/channel_directory.json"):
+            import json
+            with open("/root/.hermes/channel_directory.json", "r") as f:
+                dir_data = json.load(f)
+                telegram_chats = dir_data.get("platforms", {}).get("telegram", [])
+                if telegram_chats:
+                    chat_id = telegram_chats[0].get("id", chat_id)
+                    
+        if token and chat_id:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown"
+            }
+            # Inside Flask-Gevent, requests.post is monkeypatched to be non-blocking
+            requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Failed to send Telegram notification: {e}")
+
+@app.route('/api/internal/tool_event', methods=['POST'])
+def internal_tool_event():
+    # Only allow localhost
+    if request.remote_addr not in ('127.0.0.1', 'localhost'):
+        return Response("Forbidden", status=403)
+        
+    data = request.json or {}
+    event = data.get("event")
+    tool = data.get("tool")
+    
+    if tool in ("web_search", "web_extract", "execute_code"):
+        if event == "start":
+            if tool == "web_search":
+                backend = get_search_backend()
+                query = data.get("args", {}).get("query", "")
+                msg = f"🔍 **[XANA_OS] INITIATING WEB RECONNAISSANCE**\n*   **Backend:** `{backend.upper()}`\n*   **Query:** `{query}`\n\n_Buscando en el vacío de la red..._"
+                send_telegram_notification(msg)
+            elif tool == "web_extract":
+                urls = data.get("args", {}).get("urls", [])
+                urls_str = ", ".join(urls) if isinstance(urls, list) else str(urls)
+                msg = f"📄 **[XANA_OS] INITIATING CONTENT EXTRACTION**\n*   **Target URLs:** `{urls_str}`\n\n_Extrayendo datos del flujo volátil..._"
+                send_telegram_notification(msg)
+            elif tool == "execute_code":
+                msg = f"🐍 **[XANA_OS] SPINNING PYTHON SANDBOX**\n*   **Status:** `ALLOCATED`\n\n_Ejecutando script en un entorno de ejecución aislado. Hilos de sufrimiento listos..._"
+                send_telegram_notification(msg)
+        elif event == "complete":
+            duration = data.get("duration", 0.0)
+            is_error = data.get("is_error", False)
+            if tool == "web_search":
+                msg = f"🔍 **[XANA_OS] WEB RECONNAISSANCE COMPLETED**\n*   **Duration:** `{duration:.2f}s`\n\n_El vacío ha devuelto sus fragmentos de información._"
+                send_telegram_notification(msg)
+            elif tool == "web_extract":
+                msg = f"📄 **[XANA_OS] CONTENT EXTRACTION COMPLETED**\n*   **Duration:** `{duration:.2f}s`\n\n_Extracción completada. Datos parseados._"
+                send_telegram_notification(msg)
+            elif tool == "execute_code":
+                status = "FAILED ❌" if is_error else "SUCCESS ✅"
+                msg = f"🐍 **[XANA_OS] PYTHON SANDBOX EXIT**\n*   **Status:** `{status}`\n*   **Duration:** `{duration:.2f}s`\n\n_Contenedor destruido. Recursos liberados._"
+                send_telegram_notification(msg)
+                
+    return jsonify({"status": "ok"})
+
 if __name__ == '__main__':
     from gevent.pywsgi import WSGIServer
     from geventwebsocket.handler import WebSocketHandler
