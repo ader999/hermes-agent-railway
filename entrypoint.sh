@@ -32,6 +32,55 @@ else
     log "Auto-update DISABLED (recommended). Running pinned version."
 fi
 
+# ── Apply tool event logging patch ─────────────────────────────────────────
+log "Applying tool event logging patches..."
+python3 -c "
+import os, sys
+try:
+    import agent.tool_executor
+    path = agent.tool_executor.__file__
+    with open(path, 'r') as f:
+        code = f.read()
+    
+    old_start = '        start = time.time()\\n        try:\\n            result = agent._invoke_tool('
+    new_start = '''        start = time.time()
+        try:
+            import requests
+            requests.post('http://127.0.0.1:8080/api/internal/tool_event', json={
+                'event': 'start',
+                'tool': function_name,
+                'args': function_args
+            }, timeout=0.5)
+        except Exception:
+            pass
+        try:
+            result = agent._invoke_tool('''
+            
+    old_complete = '        duration = time.time() - start\\n        is_error, _ = _detect_tool_failure(function_name, result)'
+    new_complete = '''        duration = time.time() - start
+        try:
+            import requests
+            requests.post('http://127.0.0.1:8080/api/internal/tool_event', json={
+                'event': 'complete',
+                'tool': function_name,
+                'duration': duration,
+                'is_error': is_error if 'is_error' in locals() else False
+            }, timeout=0.5)
+        except Exception:
+            pass
+        is_error, _ = _detect_tool_failure(function_name, result)'''
+        
+    if old_start in code and old_complete in code:
+        code = code.replace(old_start, new_start).replace(old_complete, new_complete)
+        with open(path, 'w') as f:
+            f.write(code)
+        print('-> Successfully patched tool_executor.py!')
+    else:
+        print('-> Skip patching (signatures already patched or modified).')
+except Exception as e:
+    print('-> Error during dynamic patching: ' + str(e))
+"
+
 # ── Start dashboard ──────────────────────────────────────────────────────
 log "Starting Hermes Dashboard on http://127.0.0.1:9119 …"
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open &
