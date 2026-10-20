@@ -109,9 +109,15 @@ cleanup() {
 
 trap cleanup SIGTERM SIGINT
 
-# 1. Start the Flask auth proxy first
+# 1. Start the Flask auth proxy first with an auto-respawn supervisor loop
 echo "-> Launching Hardened Auth Proxy (Port ${PORT:-8080})..."
-python3 /auth_proxy.py &
+(
+    while true; do
+        python3 /auth_proxy.py
+        echo "WARN: Hardened Auth Proxy exited ($?), respawning in 1s..." >&2
+        sleep 1
+    done
+) &
 PROXY_PID=$!
 
 sleep 2
@@ -120,7 +126,7 @@ if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "ERROR: Hardened Auth Proxy failed to start!" >&2
     exit 1
 fi
-echo "-> Hardened Auth Proxy successfully running (PID: $PROXY_PID)."
+echo "-> Hardened Auth Proxy supervisor successfully running (PID: $PROXY_PID)."
 
 # 2. Start the Hermes Dashboard (internal port 9119)
 echo "-> Launching Internal Hermes Dashboard (127.0.0.1:9119)..."
