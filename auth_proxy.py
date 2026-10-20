@@ -688,6 +688,9 @@ class ReverseProxyApp:
     def __init__(self, flask_app):
         self.flask_app = flask_app
 
+    def app_protocol(self, path):
+        return "hermes-gateway-v1"
+
     def __call__(self, environ, start_response):
         ws = environ.get('wsgi.websocket')
         if ws is not None:
