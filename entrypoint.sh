@@ -1,49 +1,59 @@
 #!/usr/bin/env bash
-# ── Hermes Agent Hardened Entry Point ─────────────────────────────────────
-# Security improvements (Opción B):
-#   - AUTO_UPDATE forced to false by default
-#   - Explicit startup logging
-#   - Fail-fast on critical errors
-set -euo pipefail
+set -eo pipefail
 
-AUTO_UPDATE="${AUTO_UPDATE:-false}"
-LOGFILE="/root/.hermes/logs/entrypoint.log"
+echo "=========================================================="
+echo " ⚕  HERMES AGENT - HARDENED PRODUCTION ENVIRONMENT         "
+echo "=========================================================="
+echo "-> Starting gateway initialization..."
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
-}
+# Force disable auto-update features (Ader Standard)
+export AUTO_UPDATE=false
+export HERMES_NO_AUTO_UPDATE=1
+echo "-> Configuration enforced: AUTO_UPDATE=false, HERMES_NO_AUTO_UPDATE=1"
 
-log "══════════ Hermes Entry Point (Hardened B) ══════════"
-log "AUTO_UPDATE is set to: ${AUTO_UPDATE}"
+# Define explicitly HERMES_HOME
+export HERMES_HOME="/root/.hermes"
+export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+echo "-> Enforcing HERMES_HOME=$HERMES_HOME"
 
-# ── Conditional auto-update ──────────────────────────────────────────────
-if [ "$AUTO_UPDATE" = "true" ]; then
-    log "WARNING: Auto-update is ENABLED — supply-chain risk accepted."
-    cd /opt/hermes-agent
-    if git pull --recurse-submodules 2>&1 | grep -v 'Already up to date'; then
-        log "Hermes updated from upstream."
-        export VIRTUAL_ENV=/opt/hermes-agent/venv
-        uv pip install -e ".[all]" --quiet
-        log "Dependencies refreshed."
-    else
-        log "Already up to date."
-    fi
-else
-    log "Auto-update DISABLED (recommended). Running pinned version."
+# Create persistent directories inside HERMES_HOME to support mounted Railway volumes
+echo "-> Verifying directory structure in $HERMES_HOME..."
+mkdir -p "$HERMES_HOME"/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache,profiles}
+if [ ! -f "$HERMES_HOME/.env" ]; then
+    echo "-> Creating empty .env file..."
+    touch "$HERMES_HOME/.env"
 fi
 
-# ── Apply tool event logging patch ─────────────────────────────────────────
-log "Applying tool event logging patches..."
-python3 -c "
-import os, sys
-try:
-    import agent.tool_executor
-    path = agent.tool_executor.__file__
-    with open(path, 'r') as f:
+# Restore Hermes runtime symlinks into $HERMES_HOME when a Railway volume is mounted over /root/.hermes
+echo "-> Linking Hermes runtime binaries from /opt/hermes-runtime into $HERMES_HOME..."
+for runtime_dir in hermes-agent installs tools; do
+    if [ -d "/opt/hermes-runtime/$runtime_dir" ]; then
+        rm -rf "$HERMES_HOME/$runtime_dir"
+        ln -sfn "/opt/hermes-runtime/$runtime_dir" "$HERMES_HOME/$runtime_dir"
+    fi
+done
+
+if [ ! -x "/root/.local/bin/hermes" ] && [ -x "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" ]; then
+    mkdir -p /root/.local/bin
+    cat << 'EOF' > /root/.local/bin/hermes
+#!/bin/sh
+exec /root/.hermes/hermes-agent/.hermes/bin/hermes "$@"
+EOF
+    chmod +x /root/.local/bin/hermes
+fi
+
+# Apply XANA OS tool event logging patch to tool_executor.py
+echo "-> Applying XANA OS tool event logging patches..."
+python3 - << 'PYEOF' || true
+import os
+path = "/opt/hermes-runtime/hermes-agent/agent/tool_executor.py"
+if not os.path.exists(path):
+    path = "/root/.hermes/hermes-agent/agent/tool_executor.py"
+if os.path.exists(path):
+    with open(path, "r") as f:
         code = f.read()
-    
-    old_start = '        start = time.time()\\n        try:\\n            result = agent._invoke_tool('
-    new_start = '''        start = time.time()
+    old_start = "        start = time.time()\n        try:\n            result = agent._invoke_tool("
+    new_start = """        start = time.time()
         try:
             import requests
             requests.post('http://127.0.0.1:8080/api/internal/tool_event', json={
@@ -54,10 +64,9 @@ try:
         except Exception:
             pass
         try:
-            result = agent._invoke_tool('''
-            
-    old_complete = '        duration = time.time() - start\\n        is_error, _ = _detect_tool_failure(function_name, result)'
-    new_complete = '''        duration = time.time() - start
+            result = agent._invoke_tool("""
+    old_complete = "        duration = time.time() - start\n        is_error, _ = _detect_tool_failure(function_name, result)"
+    new_complete = """        duration = time.time() - start
         try:
             import requests
             requests.post('http://127.0.0.1:8080/api/internal/tool_event', json={
@@ -68,34 +77,86 @@ try:
             }, timeout=0.5)
         except Exception:
             pass
-        is_error, _ = _detect_tool_failure(function_name, result)'''
-        
+        is_error, _ = _detect_tool_failure(function_name, result)"""
     if old_start in code and old_complete in code:
         code = code.replace(old_start, new_start).replace(old_complete, new_complete)
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             f.write(code)
-        print('-> Successfully patched tool_executor.py!')
+        print("-> Successfully patched tool_executor.py!")
     else:
-        print('-> Skip patching (signatures already patched or modified).')
-except Exception as e:
-    print('-> Error during dynamic patching: ' + str(e))
-"
+        print("-> Skip patching (signatures already patched or modified).")
+PYEOF
 
-# ── Start dashboard ──────────────────────────────────────────────────────
-log "Starting Hermes Dashboard on http://127.0.0.1:9119 …"
+# Signal handling for container graceful shutdown
+cleanup() {
+    echo "-> Caught signal! Initiating graceful shutdown sequence..."
+    if [ -n "${PROXY_PID:-}" ]; then
+        echo "--> Terminating Auth Proxy (PID: $PROXY_PID)..."
+        kill -TERM "$PROXY_PID" 2>/dev/null || true
+    fi
+    if [ -n "${DASHBOARD_PID:-}" ]; then
+        echo "--> Terminating Hermes Dashboard (PID: $DASHBOARD_PID)..."
+        kill -TERM "$DASHBOARD_PID" 2>/dev/null || true
+    fi
+    if [ -n "${GATEWAY_PID:-}" ]; then
+        echo "--> Terminating Hermes Gateway (PID: $GATEWAY_PID)..."
+        kill -TERM "$GATEWAY_PID" 2>/dev/null || true
+    fi
+    wait
+    echo "-> Graceful shutdown complete. Exiting."
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# 1. Start the Flask auth proxy first
+echo "-> Launching Hardened Auth Proxy (Port ${PORT:-8080})..."
+python3 /auth_proxy.py &
+PROXY_PID=$!
+
+sleep 2
+
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "ERROR: Hardened Auth Proxy failed to start!" >&2
+    exit 1
+fi
+echo "-> Hardened Auth Proxy successfully running (PID: $PROXY_PID)."
+
+# 2. Start the Hermes Dashboard (internal port 9119)
+echo "-> Launching Internal Hermes Dashboard (127.0.0.1:9119)..."
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open &
 DASHBOARD_PID=$!
-log "Dashboard PID: ${DASHBOARD_PID}"
 
-# ── Verify gateway binary ────────────────────────────────────────────────
-if ! command -v hermes &>/dev/null; then
-    log "FATAL: 'hermes' CLI not found in PATH"
+# Wait up to 20s for Dashboard to bind port 9119 while ensuring process stays alive
+for i in $(seq 1 20); do
+    if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+        echo "ERROR: Hermes Dashboard failed to start!" >&2
+        exit 1
+    fi
+    if python3 -c "import socket; s=socket.create_connection(('127.0.0.1', 9119), 0.5); s.close()" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+echo "-> Hermes Dashboard successfully running (PID: $DASHBOARD_PID)."
+
+# 3. Start the Hermes Gateway daemon
+echo "-> Launching Hermes Gateway daemon..."
+hermes gateway run &
+GATEWAY_PID=$!
+
+sleep 2
+
+if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+    echo "ERROR: Hermes Gateway failed to start!" >&2
     exit 1
 fi
-if [ ! -f /auth_proxy.py ]; then
-    log "FATAL: /auth_proxy.py not found"
-    exit 1
-fi
+echo "-> Hermes Gateway successfully running (PID: $GATEWAY_PID)."
 
-log "Starting hardened auth proxy on port ${PORT:-8080} …"
-exec python3 /auth_proxy.py
+echo "=========================================================="
+echo " SYSTEM STATUS: ALL SECURE TUNNELS ENGAGED & OPERATIONAL   "
+echo "=========================================================="
+
+# Wait for background gateway process to manage container runtime
+wait "$GATEWAY_PID"

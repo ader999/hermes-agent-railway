@@ -1,49 +1,68 @@
-# ── Hermes Agent Hardened Dockerfile (Opción B) ──────────────────────────
-# Security improvements:
-#   - Pinned Python 3.11 for reproducibility
-#   - --no-install-recommends to reduce attack surface
-#   - Cloned from official NousResearch/hermes-agent (single source of truth)
-#   - No auto-update by default (controlled via AUTO_UPDATE env var)
-#   - Working directory isolation
-
 FROM python:3.11-slim
 
-# ── System dependencies ──────────────────────────────────────────────────
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-    git curl ca-certificates ripgrep ffmpeg \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PORT=8080 \
+    AUTO_UPDATE=false \
+    HERMES_NO_AUTO_UPDATE=1 \
+    HERMES_HOME=/root/.hermes \
+    PATH="/root/.local/bin:/usr/local/bin:$PATH"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    ca-certificates \
+    ripgrep \
+    ffmpeg \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 (LTS) - Needed for Hermes Agent browser & web dashboard features
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# ── UV package manager ───────────────────────────────────────────────────
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+# Install Python packages required for the hardened proxy
+RUN pip install --no-cache-dir \
+    flask \
+    requests \
+    gevent \
+    gevent-websocket \
+    websocket-client \
+    pyyaml
 
-# ── Hermes installation (from official source) ───────────────────────────
-RUN git clone --recurse-submodules \
-    https://github.com/NousResearch/hermes-agent.git \
-    /opt/hermes-agent
+# Install Hermes Agent using the official script in non-interactive mode
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup --skip-browser
 
-WORKDIR /opt/hermes-agent
-RUN uv venv venv --python 3.11 \
-    && VIRTUAL_ENV=/opt/hermes-agent/venv uv pip install -e ".[all]"
+# Relocate Hermes runtime directories outside /root/.hermes so mounting a persistent
+# Railway volume onto /root/.hermes at container startup never masks the binary or venv.
+RUN mkdir -p /opt/hermes-runtime \
+    && for dir in hermes-agent installs tools; do \
+         if [ -e "/root/.hermes/$dir" ]; then \
+           mv "/root/.hermes/$dir" "/opt/hermes-runtime/$dir" && \
+           ln -s "/opt/hermes-runtime/$dir" "/root/.hermes/$dir"; \
+         fi; \
+       done
 
-ENV PATH="/opt/hermes-agent/venv/bin:$PATH"
-
-# ── Prepare persistent directories ────────────────────────────────────────
-RUN mkdir -p /root/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache} \
-    && if [ -f cli-config.yaml.example ]; then \
-    cp cli-config.yaml.example /root/.hermes/config.yaml; \
-    fi \
+# Ensure required persistent directories are created in default image layer
+RUN mkdir -p /root/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache,profiles} \
     && touch /root/.hermes/.env
 
-# ── Copy our hardened files ──────────────────────────────────────────────
+# Copy application files
 COPY auth_proxy.py /auth_proxy.py
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh \
-    && chmod 644 /auth_proxy.py
+COPY Dockerfile /Dockerfile
 
-# ── Runtime ──────────────────────────────────────────────────────────────
+# Ensure entrypoint.sh is executable
+RUN chmod +x /entrypoint.sh && chmod 644 /auth_proxy.py
+
+# Set active working directory
+WORKDIR /root
+
+# Expose public proxy port
 EXPOSE 8080
+
+# Define entrypoint
 ENTRYPOINT ["/entrypoint.sh"]

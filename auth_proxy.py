@@ -31,12 +31,21 @@ PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 COOKIE = "hermes_auth"
 MAX_AGE = 7 * 86400
 
-# Derive a consistent HMAC key from PASSWORD to survive restarts, or fallback to random
+PUBLIC_PATHS = {
+    "/api/status",
+    "/api/health",
+    "/auth/password-login",
+    "/api/auth/ws-ticket",
+}
+PUBLIC_PREFIXES = (
+    "/auth/native/",
+)
+
+# Derive a consistent HMAC key from PASSWORD to survive restarts
 if not PASSWORD:
     logger.error("ERROR: DASHBOARD_PASSWORD must be set.")
     sys.exit(1)
 
-# Derive stable 32-byte secret key from password
 SECRET_KEY = hashlib.sha256(PASSWORD.encode()).digest()
 
 # Rate limiting settings
@@ -46,7 +55,6 @@ login_attempts = defaultdict(list)
 
 def is_rate_limited(ip):
     now = time.time()
-    # Prune old timestamps
     login_attempts[ip] = [t for t in login_attempts[ip] if now - t < RATE_LIMIT_WINDOW]
     if len(login_attempts[ip]) >= RATE_LIMIT:
         return True
@@ -67,6 +75,21 @@ def check_token(token):
         return hmac.compare_digest(sig, expected)
     except Exception:
         return False
+
+def is_public_path(path_str):
+    normalized = "/" + path_str.lstrip("/")
+    if normalized in PUBLIC_PATHS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+
+def is_request_authenticated():
+    token = request.cookies.get(COOKIE)
+    if token and check_token(token):
+        return True
+    proxy_key = request.headers.get("X-Proxy-Key") or request.headers.get("X-Proxy-Token")
+    if proxy_key and hmac.compare_digest(proxy_key, PASSWORD):
+        return True
+    return False
 
 # Custom cyberpunk terminal styled login page
 LOGIN_HTML = """<!DOCTYPE html>
@@ -105,7 +128,6 @@ LOGIN_HTML = """<!DOCTYPE html>
     position: relative;
     overflow: hidden;
   }
-  /* Retro scanlines and grid effect */
   body::before {
     content: '';
     position: fixed;
@@ -419,22 +441,18 @@ gwStatus();setInterval(gwStatus,10000);
 </script>
 """
 
-# Flask App Initialisation
 app = Flask(__name__)
 
-# Helpers to manage gateway status
 def volume_attached():
     return os.path.ismount(HERMES_HOME)
 
 def is_gateway_running():
-    # Check 1: pgrep for hermes gateway
     try:
         res = subprocess.run(["pgrep", "-f", "hermes gateway run"], capture_output=True)
         if res.returncode == 0:
             return True
     except Exception:
         pass
-    # Check 2: Connection to API port 8642
     import socket
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -445,7 +463,6 @@ def is_gateway_running():
         pass
     return False
 
-# Security headers middleware
 @app.after_request
 def add_security_headers(response):
     response.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
@@ -465,7 +482,6 @@ def add_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
 
-# Web Routes
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     ip = request.remote_addr or 'unknown'
@@ -501,16 +517,13 @@ def health():
 
 @app.route('/api/gateway/restart', methods=['POST'])
 def restart_gateway():
-    # Authentication check
-    token = request.cookies.get(COOKIE)
-    if not token or not check_token(token):
+    if not is_request_authenticated():
         return jsonify({"error": "Unauthorized"}), 401
         
     logger.info("Restarting hermes gateway...")
     try:
         subprocess.run(["pkill", "-f", "hermes gateway run"])
         time.sleep(1)
-        # Propagate environment explicitly including HERMES_HOME
         env = os.environ.copy()
         env["HERMES_HOME"] = HERMES_HOME
         subprocess.Popen(["hermes", "gateway", "run"], env=env)
@@ -521,8 +534,7 @@ def restart_gateway():
 
 @app.route('/api/gateway/status')
 def gateway_status():
-    token = request.cookies.get(COOKIE)
-    if not token or not check_token(token):
+    if not is_request_authenticated():
         return jsonify({"error": "Unauthorized"}), 401
         
     return jsonify({
@@ -530,74 +542,19 @@ def gateway_status():
         "volume": volume_attached()
     })
 
-# Main proxy and websocket proxy route
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def proxy_root(path):
-    # Verify Authentication
-    token = request.cookies.get(COOKIE)
-    if not token or not check_token(token):
+    if not is_public_path(path) and not is_request_authenticated():
         if request.path.startswith('/api/'):
             return Response("Unauthorized", status=401)
         return redirect(url_for('login'))
 
-    # WebSocket Proxy Implementation
-    ws = request.environ.get('wsgi.websocket')
-    if ws:
-        # Convert UPSTREAM http to ws
-        ws_upstream_url = UPSTREAM.replace('http://', 'ws://').replace('https://', 'wss://') + '/' + path
-        if request.query_string:
-            ws_upstream_url += '?' + request.query_string.decode('utf-8')
-            
-        logger.info(f"Establishing WebSocket tunnel: {request.path} -> {ws_upstream_url}")
-        try:
-            ws_upstream = websocket.create_connection(ws_upstream_url)
-        except Exception as e:
-            logger.error(f"WebSocket upstream connection failed: {e}")
-            return Response("Bad Gateway", status=502)
-            
-        def tunnel_client_to_upstream():
-            try:
-                while True:
-                    msg = ws.receive()
-                    if msg is None:
-                        break
-                    ws_upstream.send(msg)
-            except Exception:
-                pass
-            finally:
-                try:
-                    ws_upstream.close()
-                except Exception:
-                    pass
-
-        def tunnel_upstream_to_client():
-            try:
-                while True:
-                    msg = ws_upstream.recv()
-                    ws.send(msg)
-            except Exception:
-                pass
-            finally:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-
-        g1 = gevent.spawn(tunnel_client_to_upstream)
-        g2 = gevent.spawn(tunnel_upstream_to_client)
-        gevent.joinall([g1, g2])
-        return ""
-
-    # HTTP / Streaming Proxy Implementation
     url = f"{UPSTREAM}/{path}"
     if request.query_string:
         url += f"?{request.query_string.decode('utf-8')}"
 
-    # Forward headers
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
-    
-    # Forward body
     data = request.get_data()
 
     try:
@@ -613,13 +570,11 @@ def proxy_root(path):
         logger.error(f"HTTP upstream connection failed for {url}: {e}")
         return Response("Bad Gateway", status=502)
 
-    # Filter upstream response headers
     excluded = {'transfer-encoding', 'content-encoding', 'content-length'}
-    proxy_headers = {k: v for k, v in resp.raw.headers.items() if k.lower() not in excluded}
+    proxy_headers = [(k, v) for k, v in resp.raw.headers.items() if k.lower() not in excluded]
 
     content_type = resp.headers.get('content-type', '')
     
-    # Inject widget on HTML pages
     if 'text/html' in content_type:
         try:
             html = resp.content.decode('utf-8', errors='replace')
@@ -629,7 +584,6 @@ def proxy_root(path):
         except Exception as e:
             logger.error(f"Error parsing HTML response: {e}")
 
-    # Streaming support
     def generate():
         try:
             for chunk in resp.iter_content(chunk_size=4096):
@@ -638,7 +592,6 @@ def proxy_root(path):
             logger.error(f"Stream error: {e}")
 
     return Response(generate(), status=resp.status_code, headers=proxy_headers, content_type=content_type)
-
 
 
 # =====================================================================
@@ -683,14 +636,12 @@ def send_telegram_notification(message):
                 "text": message,
                 "parse_mode": "Markdown"
             }
-            # Inside Flask-Gevent, requests.post is monkeypatched to be non-blocking
             requests.post(url, json=payload, timeout=5)
     except Exception as e:
         logger.error(f"Failed to send Telegram notification: {e}")
 
 @app.route('/api/internal/tool_event', methods=['POST'])
 def internal_tool_event():
-    # Only allow localhost
     if request.remote_addr not in ('127.0.0.1', 'localhost'):
         return Response("Forbidden", status=403)
         
@@ -729,11 +680,112 @@ def internal_tool_event():
                 
     return jsonify({"status": "ok"})
 
+
+class ReverseProxyApp:
+    """WSGI wrapper that intercepts WebSocket upgrades directly before Flask/Werkzeug
+    routing (avoiding WebsocketMismatch on regular HTTP routes) and tunnels frames
+    to the internal Hermes FastAPI backend with subprotocol and ticket support."""
+    def __init__(self, flask_app):
+        self.flask_app = flask_app
+
+    def __call__(self, environ, start_response):
+        ws = environ.get('wsgi.websocket')
+        if ws is not None:
+            return self._handle_websocket(environ, start_response, ws)
+        return self.flask_app(environ, start_response)
+
+    def _handle_websocket(self, environ, start_response, ws):
+        path_info = environ.get('PATH_INFO', '') or '/'
+        query_string = environ.get('QUERY_STRING', '')
+
+        ws_upstream_url = UPSTREAM.replace('http://', 'ws://').replace('https://', 'wss://') + path_info
+        if query_string:
+            ws_upstream_url += '?' + query_string
+
+        ws_headers = []
+        cookie_hdr = environ.get('HTTP_COOKIE')
+        if cookie_hdr:
+            ws_headers.append(f"Cookie: {cookie_hdr}")
+        auth_hdr = environ.get('HTTP_AUTHORIZATION')
+        if auth_hdr:
+            ws_headers.append(f"Authorization: {auth_hdr}")
+        ua_hdr = environ.get('HTTP_USER_AGENT')
+        if ua_hdr:
+            ws_headers.append(f"User-Agent: {ua_hdr}")
+
+        proto_hdr = environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL', '')
+        subprotocols = [p.strip() for p in proto_hdr.split(',') if p.strip()] if proto_hdr else None
+
+        logger.info(f"Establishing WebSocket tunnel: {path_info} (qs={bool(query_string)}, subprotocols={subprotocols}) -> {ws_upstream_url}")
+        try:
+            ws_upstream = websocket.create_connection(
+                ws_upstream_url,
+                header=ws_headers,
+                subprotocols=subprotocols,
+                origin="http://127.0.0.1:9119",
+                enable_multithread=True,
+            )
+        except Exception as e:
+            logger.error(f"WebSocket upstream connection failed for {ws_upstream_url}: {e}")
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return []
+
+        def tunnel_client_to_upstream():
+            try:
+                while True:
+                    msg = ws.receive()
+                    if msg is None:
+                        break
+                    if isinstance(msg, (bytes, bytearray)):
+                        ws_upstream.send_binary(msg)
+                    else:
+                        ws_upstream.send(msg)
+            except Exception as e:
+                logger.debug(f"WS client->upstream closed: {e}")
+            finally:
+                try:
+                    ws_upstream.close()
+                except Exception:
+                    pass
+
+        def tunnel_upstream_to_client():
+            try:
+                while True:
+                    opcode, data = ws_upstream.recv_data()
+                    if opcode == websocket.ABNF.OPCODE_CLOSE:
+                        break
+                    elif opcode == websocket.ABNF.OPCODE_BINARY:
+                        ws.send(data, binary=True)
+                    elif opcode == websocket.ABNF.OPCODE_TEXT:
+                        ws.send(data.decode('utf-8', errors='replace'), binary=False)
+            except Exception as e:
+                logger.debug(f"WS upstream->client closed: {e}")
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+        g1 = gevent.spawn(tunnel_client_to_upstream)
+        g2 = gevent.spawn(tunnel_upstream_to_client)
+        gevent.joinall([g1, g2])
+        return []
+
+
 if __name__ == '__main__':
     from gevent.pywsgi import WSGIServer
     from geventwebsocket.handler import WebSocketHandler
-    
+
+    class GatewayWebSocketHandler(WebSocketHandler):
+        def select_subprotocol(self, subprotocols):
+            if "hermes-gateway-v1" in subprotocols:
+                return "hermes-gateway-v1"
+            return subprotocols[0] if subprotocols else None
+
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting hardened Flask-Gevent proxy on port {port}...")
-    server = WSGIServer(('0.0.0.0', port), app, handler_class=WebSocketHandler)
+    server = WSGIServer(('0.0.0.0', port), ReverseProxyApp(app), handler_class=GatewayWebSocketHandler)
     server.serve_forever()
